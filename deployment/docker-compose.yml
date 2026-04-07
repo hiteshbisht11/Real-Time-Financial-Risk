@@ -1,0 +1,124 @@
+# Full local development stack.
+#
+# Services:
+#   fraud-api      - FastAPI inference service (port 8000)
+#   kafka          - Message broker for transaction stream (port 9092)
+#   zookeeper      - Kafka coordination service (internal)
+#   redis          - Online feature store for velocity counters (port 6379)
+#   kafka-ui       - Web UI to inspect Kafka topics (port 8080)
+#
+# HOW TO START:
+#   docker-compose up -d                          # all services
+#   docker-compose up -d kafka zookeeper redis    # just infrastructure
+#   docker-compose logs -f fraud-api              # tail inference logs
+#
+# HOW TO TEST END-TO-END:
+#   1. docker-compose up -d
+#   2. python -m src.training.train               # train + save model
+#   3. python -m src.ingestion.kafka_producer --max-events 500  # produce transactions
+#   4. python -m src.ingestion.kafka_consumer     # consume + score (in another terminal)
+#   5. curl http://localhost:8000/health           # check API
+
+version: "3.9"
+
+services:
+  # ---- Zookeeper (Kafka dependency) ----
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---- Kafka ----
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # PLAINTEXT_HOST allows connections from your laptop (outside Docker)
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Default partitions=12 for parallelism
+      KAFKA_NUM_PARTITIONS: 12
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:29092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # ---- Redis (Online Feature Store) ----
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    # LRU eviction: when Redis hits 512MB, it evicts least-recently-used keys.
+    # For velocity features, this is fine — old velocity data is worthless anyway.
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---- FastAPI Inference Service ----
+  fraud-api:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    container_name: fraud-api
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      MODEL_VERSION: v1
+      REDIS_URL: redis://redis:6379/0
+      REVIEW_THRESHOLD: "0.3"
+      BLOCK_THRESHOLD: "0.7"
+    volumes:
+      # Mount model artifacts from host — swap model version without rebuilding image
+      - ../src/models/artifacts:/app/src/models/artifacts:ro
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # ---- Kafka UI (Development convenience) ----
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    restart: unless-stopped
+
+volumes:
+  redis_data:
